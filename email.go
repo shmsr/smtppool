@@ -72,13 +72,14 @@ const (
 
 var (
 	// ErrMissingBoundary is returned when there is no boundary given for a multipart entity.
-	ErrMissingBoundary = errors.New("No boundary found for multipart entity")
+	ErrMissingBoundary = errors.New("no boundary found for multipart entity")
 
 	// ErrMissingContentType is returned when there is no "Content-Type" header for a MIME entity.
-	ErrMissingContentType = errors.New("No Content-Type found for MIME entity")
+	ErrMissingContentType = errors.New("no Content-Type found for MIME entity")
 
-	msgHeaders = []string{HdrReplyTo, HdrTo, HdrCC, HdrFrom, HdrSubject,
-		HdrDate, HdrMessageID, HdrMimeVersion}
+	msgHeaders = []string{
+		HdrReplyTo, HdrTo, HdrCC, HdrFrom, HdrSubject, HdrDate, HdrMessageID, HdrMimeVersion,
+	}
 
 	maxBigInt = big.NewInt(math.MaxInt64)
 )
@@ -284,7 +285,6 @@ func (e *Email) Bytes() ([]byte, error) {
 	// Check to see if there is a Text or HTML field.
 	if len(e.Text) > 0 || len(e.HTML) > 0 {
 		var subWriter *multipart.Writer
-
 		if isMixed && isAlternative {
 			// Create the multipart alternative part.
 			subWriter = multipart.NewWriter(buff)
@@ -435,7 +435,7 @@ func parseMIMEParts(hs textproto.MIMEHeader, b io.Reader) ([]*part, error) {
 // Attach is used to attach content from an io.Reader to the email.
 // Required parameters include an io.Reader, the desired filename for the attachment, and the Content-Type
 // The function will return the created Attachment for reference, as well as nil for the error, if successful.
-func (e *Email) Attach(r io.Reader, filename string, c string) (a Attachment, err error) {
+func (e *Email) Attach(r io.Reader, filename, c string) (a Attachment, err error) {
 	var buffer bytes.Buffer
 	if _, err = io.Copy(&buffer, r); err != nil {
 		return
@@ -622,7 +622,7 @@ func base64Wrap(w io.Writer, b []byte) {
 
 	// Buffer for each line, including trailing CRLF.
 	buffer := make([]byte, MaxLineLength+len("\r\n"))
-	copy(buffer[MaxLineLength:], "\r\n")
+	copy(buffer[MaxLineLength:], []byte{'\r', '\n'})
 
 	// Process raw chunks until there's no longer enough to fill a line.
 	for len(b) >= maxRaw {
@@ -635,7 +635,7 @@ func base64Wrap(w io.Writer, b []byte) {
 	if len(b) > 0 {
 		out := buffer[:base64.StdEncoding.EncodedLen(len(b))]
 		base64.StdEncoding.Encode(out, b)
-		out = append(out, "\r\n"...)
+		out = append(out, '\r', '\n')
 		w.Write(out)
 	}
 }
@@ -646,8 +646,8 @@ func headerToBytes(buff io.Writer, header textproto.MIMEHeader) {
 	for field, vals := range header {
 		for _, subval := range vals {
 			// bytes.Buffer.Write() never returns an error.
-			io.WriteString(buff, field)
-			io.WriteString(buff, ": ")
+			_, _ = io.WriteString(buff, field)
+			_, _ = io.WriteString(buff, ": ")
 			// Write the encoded header if needed
 			switch {
 			case field == HdrContentType || field == HdrContentDisposition:
@@ -658,6 +658,16 @@ func headerToBytes(buff io.Writer, header textproto.MIMEHeader) {
 			io.WriteString(buff, "\r\n")
 		}
 	}
+}
+
+var host = hostname()
+
+func hostname() string {
+	h, err := os.Hostname()
+	if err != nil {
+		return defaultHostname
+	}
+	return h
 }
 
 // generateMessageID generates and returns a string suitable for an RFC 2822
@@ -676,12 +686,5 @@ func generateMessageID() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	h, err := os.Hostname()
-
-	// If there is no hostname, use the default hostname.
-	if err != nil {
-		h = defaultHostname
-	}
-
-	return fmt.Sprintf("<%d.%d.%d@%s>", t, pid, rint, h), nil
+	return fmt.Sprintf("<%d.%d.%d@%s>", t, pid, rint, host), nil
 }

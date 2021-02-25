@@ -5,11 +5,11 @@ package smtppool
 import (
 	"crypto/tls"
 	"errors"
-	"fmt"
 	"net"
 	"net/mail"
 	"net/smtp"
 	"net/textproto"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -52,24 +52,22 @@ type Opt struct {
 
 // Pool represents an SMTP connection pool.
 type Pool struct {
-	opt          Opt
-	conns        chan *conn
-	createdConns int
-	lastActivity time.Time
-	mut          sync.Mutex
+	opt   Opt
+	conns chan *conn
 
 	// stopBorrow signals all waiting borrowCon() calls on the pool to
 	// immediately return an ErrPoolClosed.
-	stopBorrow chan bool
+	stopBorrow chan struct{}
 
+	mut          sync.RWMutex
+	createdConns int
 	// closed marks the pool as closed.
 	closed bool
 }
 
 // conn represents an AMTP client connection in the pool.
 type conn struct {
-	conn   *smtp.Client
-	numErr int
+	conn *smtp.Client
 
 	// lastActivity records the time when the last message on this client
 	// was sent. Used for sweeping and disconnecting idle connections.
@@ -100,7 +98,7 @@ func New(o Opt) (*Pool, error) {
 	p := &Pool{
 		opt:        o,
 		conns:      make(chan *conn, o.MaxConns),
-		stopBorrow: make(chan bool),
+		stopBorrow: make(chan struct{}),
 	}
 
 	// Start the idle connection sweeper.
@@ -153,8 +151,11 @@ func (p *Pool) Close() {
 
 // newConn creates a new SMTP client connection that can be added to the pool.
 func (p *Pool) newConn() (cn *conn, err error) {
-	netCon, err := net.DialTimeout("tcp",
-		fmt.Sprintf("%s:%d", p.opt.Host, p.opt.Port), p.opt.PoolWaitTimeout)
+	netCon, err := net.DialTimeout(
+		"tcp",
+		net.JoinHostPort(p.opt.Host, strconv.Itoa(p.opt.Port)),
+		p.opt.PoolWaitTimeout,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -175,7 +176,7 @@ func (p *Pool) newConn() (cn *conn, err error) {
 
 	// Is there a custom hostname for doing a HELLO with the SMTP server?
 	if p.opt.HelloHostname != "" {
-		sm.Hello(p.opt.HelloHostname)
+		_ = sm.Hello(p.opt.HelloHostname)
 	}
 
 	// Optional TLS.
@@ -183,7 +184,7 @@ func (p *Pool) newConn() (cn *conn, err error) {
 		if ok, _ := sm.Extension("STARTTLS"); !ok {
 			return nil, errors.New("SMTP STARTTLS extension not found")
 		}
-		if err := sm.StartTLS(p.opt.TLSConfig); err != nil {
+		if err = sm.StartTLS(p.opt.TLSConfig); err != nil {
 			return nil, err
 		}
 	}
@@ -193,14 +194,12 @@ func (p *Pool) newConn() (cn *conn, err error) {
 		if ok, _ := sm.Extension("AUTH"); !ok {
 			return nil, errors.New("SMTP AUTH extension not found")
 		}
-		if err := sm.Auth(p.opt.Auth); err != nil {
+		if err = sm.Auth(p.opt.Auth); err != nil {
 			return nil, err
 		}
 	}
 
-	return &conn{
-		conn: sm,
-	}, nil
+	return &conn{conn: sm}, nil
 }
 
 // borrowConn borrows a connection from the pool.
@@ -221,30 +220,22 @@ func (p *Pool) borrowConn() (*conn, error) {
 		p.mut.Unlock()
 	}
 
+	t := time.NewTimer(p.opt.PoolWaitTimeout)
+	defer t.Stop()
+
 	select {
 	case c := <-p.conns:
 		return c, nil
 	case <-p.stopBorrow:
 		return nil, ErrPoolClosed
-	case <-time.After(p.opt.PoolWaitTimeout):
+	case <-t.C:
 		return nil, errors.New("timed out waiting for free conn in pool")
 	}
 }
 
 // returnConn returns connection to the pool based on the error from the last
 // transaction on it.
-func (p *Pool) returnConn(c *conn, lastErr error) (err error) {
-	// If the function returns an error, that it means it's a bad connection
-	// and should be closed and not added back to the pool.
-	defer func() {
-		if err != nil {
-			p.mut.Lock()
-			p.createdConns--
-			p.mut.Unlock()
-			c.conn.Close()
-		}
-	}()
-
+func (p *Pool) returnConn(c *conn, lastErr error) error {
 	if lastErr != nil {
 		// Any error, except for textproto.Error (according to jordan-wright/email),
 		// is a bad connection that should be killed.
@@ -253,10 +244,13 @@ func (p *Pool) returnConn(c *conn, lastErr error) (err error) {
 		}
 	}
 
+	t := time.NewTimer(p.opt.PoolWaitTimeout)
+	defer t.Stop()
+
 	select {
 	case p.conns <- c:
 		return nil
-	case <-time.After(p.opt.PoolWaitTimeout):
+	case <-t.C:
 		return errors.New("timed out returning connection to pool")
 	case <-p.stopBorrow:
 		return ErrPoolClosed
@@ -267,20 +261,26 @@ func (p *Pool) returnConn(c *conn, lastErr error) (err error) {
 // any activity in Opt.IdleTimeout time. This is a blocking function and should
 // be run as a goroutine.
 func (p *Pool) sweepConns(interval time.Duration) {
-	activeConns := make([]*conn, cap(p.conns))
-	for {
-		<-time.After(interval)
+	var (
+		num, createdConns int
+		closed            bool
+	)
+
+	activeConns := make([]*conn, 0, p.opt.MaxConns)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for range ticker.C {
 		activeConns = activeConns[:0]
 
 		// The number of conns in the channel are the ones that are potentially
 		// idling. Iterate through them and examine their activity timestamp.
-		p.mut.Lock()
-		var (
-			num          = len(p.conns)
-			createdConns = p.createdConns
-			closed       = p.closed
-		)
-		p.mut.Unlock()
+		p.mut.RLock()
+		num = len(p.conns)
+		createdConns = p.createdConns
+		closed = p.closed
+		p.mut.RUnlock()
 
 		if closed && createdConns == 0 {
 			// If the pool is closed and there are no more connections, exit
@@ -311,7 +311,6 @@ func (p *Pool) sweepConns(interval time.Duration) {
 				} else {
 					_ = c.conn.Close()
 				}
-
 				continue
 			}
 
@@ -397,7 +396,7 @@ func (a *LoginAuth) Next(fromServer []byte, more bool) ([]byte, error) {
 	case "Password:":
 		return []byte(a.Password), nil
 	default:
-		return nil, errors.New("unkown SMTP fromServer")
+		return nil, errors.New("unknown SMTP fromServer")
 	}
 }
 

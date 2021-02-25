@@ -106,7 +106,7 @@ func TestEmailWithHTMLAttachments(t *testing.T) {
 	}
 
 	// Print the bytes for ocular validation and make sure no errors.
-	//fmt.Println(string(b))
+	// fmt.Println(string(b))
 
 	// TODO: Verify the attachments.
 	s := trimReader{rd: bytes.NewBuffer(b)}
@@ -379,7 +379,6 @@ d-printable decoding.</div>
 	if e.From != ex.From {
 		t.Fatalf("Incorrect \"From\": %#q != %#q", e.From, ex.From)
 	}
-
 }
 
 func TestNonAsciiEmailFromReader(t *testing.T) {
@@ -509,7 +508,7 @@ func Test_base64Wrap(t *testing.T) {
 	var buf bytes.Buffer
 	base64Wrap(&buf, []byte(file))
 	if !bytes.Equal(buf.Bytes(), []byte(encoded)) {
-		t.Fatalf("Encoded file does not match expected: %#q != %#q", string(buf.Bytes()), encoded)
+		t.Fatalf("Encoded file does not match expected: %#q != %#q", buf.String(), encoded)
 	}
 }
 
